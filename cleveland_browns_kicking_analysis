@@ -1,0 +1,803 @@
+import pandas as pd
+import datetime
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import GridSearchCV
+from sklearn import preprocessing
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score
+import re
+from sklearn import decomposition
+
+# Read in data set
+kick_data = pd.read_csv("/Users/Miller/Desktop/kicking_data.csv")
+
+#################################################################
+
+##### Cleaning Data #####
+
+# Calculate number of seconds that have elapsed in current quarter
+seconds_elapsed_in_quarter = np.array([int(kick_data.ix[row,'clock'].split(':')[0])*60 + int(kick_data.ix[row,'clock'].split(':')[1]) for row in range(len(kick_data))])
+
+# Create new column that contains how much time of the game has elapsed (seconds)
+kick_data['elapsed_time_in_game']=(kick_data['quarter']-1)*900 + seconds_elapsed_in_quarter
+
+### Cleaning up 'WindSpeed' variable ###
+
+# Creates list of row numbers that have WindSpeed value
+rows_with_wind_speed_present = [index for index in range(len(kick_data)) if ~pd.isnull(kick_data.ix[index,'WindSpeed']) >= -1]
+
+### Cleaning up WindSpeed column ###
+
+clean_windspeed = []
+for row in range(len(kick_data)):
+    if row in rows_with_wind_speed_present:
+        # Extracting integer values in the 'WindSpeed' column
+        string = re.findall('\d+', kick_data.ix[row,'WindSpeed'])
+        # Test to see if there was no integer value in the WindSpeed column
+        if len(string) == 0:
+            if (kick_data.ix[row,'WindSpeed'] == 'calm') or (kick_data.ix[row,'WindSpeed'] == 'Calm'):
+                clean_windspeed.append(3)
+            elif (kick_data.ix[row,'WindSpeed'] == 'Light') or (kick_data.ix[row,'WindSpeed'] == 'light'):
+                clean_windspeed.append(5)
+            else:
+                # Imputing two for all directional descriptions (N, NW, etc.) of wind
+                clean_windspeed.append(2)
+        elif (len(string) > 0):
+            if (len(string) == 1):
+                # Append integer value for windspeed
+                clean_windspeed.append(int(string[0]))
+            else:
+                # Avg lower/upper bound if windspeed is given as a range b/w two numbers
+                clean_windspeed.append((int(string[0])+int(string[1]))/2)
+    else:
+        # Imputing 0 for all n/a values (indoor stadiums)
+        clean_windspeed.append(0)
+
+# Replace WindSpeed column with clean values for WindSpeed
+kick_data['WindSpeed'] = np.array(clean_windspeed)
+
+# Impute 65 as the temperature for all games in indoor stadiums
+kick_data.ix[kick_data['Temperature'].isnull(),'Temperature'] = 65
+
+# Creates point_differential column
+kick_data['point_differential'] = abs(kick_data['offscore'] - kick_data['defscore'])
+
+### Cleaning up GameWeather column ###
+
+# Imputing 'Indoors' for all games where the stadium name contains "Dome"
+kick_data.GameWeather = np.where(kick_data.Stadium.str.contains("Dome|dome|Cardinals|Lucas|Reliant|Phoenix|Ford"),'Indoors',kick_data.GameWeather)
+
+# Replace GameWeather with OutdoorWeather when OutdoorWeather is present and GameWeather is not
+kick_data.GameWeather = np.where(kick_data.GameWeather.isnull() & ~kick_data.OutdoorWeather.isnull(),kick_data.OutdoorWeather,kick_data.GameWeather)
+
+### Create one-hot columns summarizing qualitative descriptions of weather ###
+
+kick_data['Indoors'] = np.where(kick_data.GameWeather.str.contains('Indoor|indoor|Dome|dome|Controlled|CONTROLLED'),1,0)
+
+kick_data['Cloudy'] = np.where(kick_data.GameWeather.str.contains('Cloudy|cloudy|Cloundy|clouds|overcast|Overcast'),1,0)
+
+kick_data['Sunny'] = np.where(kick_data.GameWeather.str.contains('Sunny|sunny|sun|Sun|sunshine|Sunshine'),1,0)
+
+kick_data['Rainy'] = np.where(kick_data.GameWeather.str.contains('Rain|rain|Rainy|rainy|wet|Wet|showers|Showers'),1,0)
+
+kick_data['Thuderstorms'] = np.where(kick_data.GameWeather.str.contains('Thunderstorm|thunderstorm|thunderstorms|Thunderstorms|storms|Storms'),1,0)
+
+kick_data['Snowy'] = np.where(kick_data.GameWeather.str.contains('Snow|snow|Snowy|snowy|flurries|sleet|Sleet'),1,0)
+
+kick_data['Clear'] = np.where(kick_data.GameWeather.str.contains('Clear|clear|fair|Fair'),1,0)
+
+### Create one-hot columns summarizing qualitative descriptions of weather ###
+
+# Impute 0 where WindDirection is n/a to allow for code below to work properly
+kick_data.WindDirection = np.where(kick_data.WindDirection.isnull(),'x',kick_data.WindDirection)
+
+kick_data['wind_east'] = np.where(kick_data.WindDirection.str.contains('E|e'),1,0)
+
+kick_data['wind_west'] = np.where(kick_data.WindDirection.str.contains('W|w'),1,0)
+
+kick_data['wind_north'] = np.where(kick_data.WindDirection.str.contains('N|n'),1,0)
+
+kick_data['wind_south'] = np.where(kick_data.WindDirection.str.contains('S|s'),1,0)
+
+# Creates one-hot column corresponding to made field goals/extra points
+kick_data['made_field_goal'] = np.where(kick_data.kickresult.str.contains("MADE"),1,0)
+
+# Converts 'hash' into a one-hot variable
+kick_data = pd.get_dummies(kick_data, columns=['hash'])
+
+# Creates one hot for specialteamstype without removing original column
+kick_data['specialteamstype_EXTRA POINT'] = np.where(kick_data.specialteamstype == 'EXTRA POINT',1,0)
+kick_data['specialteamstype_FIELD GOAL'] = np.where(kick_data.specialteamstype == 'FIELD GOAL',1,0)
+
+###################################################################################################
+###################################################################################################
+
+##### Field Goal and Extra Point Analysis #####
+
+# Create dataset containing only observations which were fg or extra points and drops observations without made/missed value
+fg_and_exp = kick_data[(kick_data.specialteamstype != 'KICKOFF') & (~kick_data.kickresult.isnull())]
+
+# Resets row indices
+fg_and_exp.reset_index(inplace=True)
+
+# Creates list of indices of negative field position values
+negatives = [i for i,x in enumerate(fg_and_exp.fieldposition<0) if x]
+
+# Creates new array containing only positive representations of field position (i.e. -42 --> 58)
+positive_field_position = np.where(fg_and_exp.fieldposition > 0, fg_and_exp.fieldposition, 100 + fg_and_exp.fieldposition)
+
+### Fixing points with incorrect fieldposition and missing kickyards ###
+positive_field_position[19301]=2 # Extra point attempt in 2014
+positive_field_position[21708]=15 # Extra poinnt attempt in 2015
+
+# Creating new field_position column
+fg_and_exp['positive_field_position'] = positive_field_position
+
+# Creates new kick distance column that contains only positive values
+fg_and_exp['true_kickyards'] = np.where(fg_and_exp.kickyards > 18, fg_and_exp.kickyards, fg_and_exp.positive_field_position+18)
+
+#### Building Model to Predict Probability of FG/XP Being Made #####
+
+predictor_columns = ['hash_C', 'hash_L', 'hash_R','true_kickyards','Humidity','Temperature','WindSpeed', 'elapsed_time_in_game', 'point_differential', 'Indoors',
+       'Cloudy', 'Sunny', 'Rainy', 'Thuderstorms', 'Snowy', 'Clear','gameseason','specialteamstype_EXTRA POINT', 'specialteamstype_FIELD GOAL', 'wind_north', 'wind_south', 'wind_east', 'wind_west']
+
+# Scales and centers the features associated with field goal/extra point attempts
+features = np.array(fg_and_exp.ix[:,predictor_columns])
+
+# Scales and centers the features
+features_std = preprocessing.scale(features)
+
+# Creates target vector
+target = np.array(fg_and_exp.ix[:,'made_field_goal'])
+
+### PCA ###
+pca = decomposition.PCA(features_std.shape[1])
+pca.fit(features_std)
+var= pca.explained_variance_ratio_ #The amount of variance that each PC explains
+var1=np.cumsum(np.round(pca.explained_variance_ratio_, decimals=4)*100) # Cumulative Variance explained by number of components
+
+# Used results of var1 and empirical testing to choose 21 components
+pca = decomposition.PCA(21)
+pca.fit(features_std)
+features_std_pca = np.array(pca.fit_transform(features_std))
+ 
+##### Fitting model to predict probability of kick being made #####
+
+## Optimal values for hyperparameters were learned using GridSearchCV (sample code below) ##
+
+# Initialzing gradient boosted trees model
+xgb_kick_prob = xgb.XGBClassifier(max_depth=3, learning_rate=0.08, min_child_weight=7, reg_lambda = 2.25, subsample = 1, colsample_bytree = 0.725)
+
+# Fits model
+xgb_kick_prob.fit(features_std_pca,target)
+
+# Generates predicted probabilities
+predictions = xgb_kick_prob.predict_proba(features_std_pca)
+
+# Create list of the predicted kick probabilities
+preds = [predictions[index][1] for index in range(len(predictions))]
+
+# Create column containing predicted probability of the kick being made
+fg_and_exp['probability_of_making_kick'] = np.array(preds)
+
+# Calculate number of points added (or lost) by making (or missing) the kick
+fg_and_exp['pts_above_expectation'] = np.where(fg_and_exp.specialteamstype == 'FIELD GOAL', (fg_and_exp['made_field_goal'] - fg_and_exp['probability_of_making_kick'])*3, (fg_and_exp['made_field_goal'] - fg_and_exp['probability_of_making_kick']))
+
+# Creates team column
+fg_and_exp['team'] , x = fg_and_exp['kicker'].str.split(' ', 1).str
+
+# Changes values for 2015 season with team name == 'LA' to 'SL'  
+fg_and_exp.ix[(fg_and_exp.team=='LA') & (fg_and_exp.gameseason == 2015),'team'] = 'SL'
+
+###################################################################################################
+
+# Used GridSearchCV to progressively find optimal values for hyperparameters
+## All models were trained using this framework
+### Only included one example of the framework for brevity
+
+# xgbm = xgb.XGBClassifier()
+
+# param_grid={'max_depth':[3],
+# 				'learning_rate':[0.08,0.085],
+# 				'min_child_weight':[5,6,7], 'reg_lambda':[2.25,2.75,3.25], 'subsample':[1], 'colsample_bytree':[0.775,0.725,0.825]}
+		
+# # Using grid search to test many different parameter values
+# grid_search = GridSearchCV(xgbm,
+# 	param_grid, scoring = 'accuracy', cv = 5)
+
+# # Finds best possible model for given out range of parameter values passed in previous line
+# grid_search.fit(features_std_pca,target)
+
+# best_XGB = grid_search.best_estimator_
+
+# print("\n\nbest XGB:\n" + str(best_XGB.get_params()) + "\n\n")
+
+###################################################################################################
+
+##### Calculating stats each team for scoring situations (fg and xp) #####
+
+# Creating column names for new dataframe
+seasons = list(range(2006,2016))
+stats = ['exp_attempted','exp_made','exp_%','exp_pts_above_expectation','fg_attempted','fg_made','fg_%','fg_pts_above_expectation']
+col_names = ["{0}_{1}".format(season,stat) for season in seasons for stat in stats]
+col_names.append('Team')
+
+# Creates new dataframe
+cumulative_stats = pd.DataFrame(columns=col_names, index=range(len(fg_and_exp.team.unique())))
+
+# Creates 'Name' column
+cumulative_stats.Team = fg_and_exp.team.unique()
+
+### Need to change kicker --> team
+for kicker in cumulative_stats.Team.unique():
+    # Mask out rows associated with a specific kicker
+    one_kicker = fg_and_exp[fg_and_exp.team == kicker]
+    for season in seasons:
+        # Mask out rows associated with exp then fg
+        one_season_one_kicker_exp_data = one_kicker[(one_kicker.gameseason==season) & (one_kicker.specialteamstype == 'EXTRA POINT')]
+        one_season_one_kicker_fg_data = one_kicker[(one_kicker.gameseason==season) & (one_kicker.specialteamstype == 'FIELD GOAL')]
+        # Calculate number of exp and fg attempted in given season by given kicker
+        cumulative_stats.ix[cumulative_stats.Team == kicker, '{0}_exp_attempted'.format(season)]=len(one_season_one_kicker_exp_data)
+        cumulative_stats.ix[cumulative_stats.Team == kicker, '{0}_fg_attempted'.format(season)]=len(one_season_one_kicker_fg_data)
+        # Calculate number of exp and fg made in given season by given kicker
+        cumulative_stats.ix[cumulative_stats.Team == kicker, '{0}_exp_made'.format(season)]=np.sum(one_season_one_kicker_exp_data.kickresult.str.contains('MADE'))
+        cumulative_stats.ix[cumulative_stats.Team == kicker, '{0}_fg_made'.format(season)]=np.sum(one_season_one_kicker_fg_data.kickresult.str.contains('MADE'))
+        #Calculate pts above expectation scored in given season by given kicker
+        cumulative_stats.ix[cumulative_stats.Team == kicker, '{0}_exp_pts_above_expectation'.format(season)]=np.sum(one_season_one_kicker_exp_data.pts_above_expectation)
+        cumulative_stats.ix[cumulative_stats.Team == kicker, '{0}_fg_pts_above_expectation'.format(season)]=np.sum(one_season_one_kicker_fg_data.pts_above_expectation)
+
+# Calculate exp_%, fg_%, and pts above expectation per att in given season by given kicker
+for season in seasons:
+    exp_att_safe_from_divide_by_0 = np.where(cumulative_stats['{0}_exp_attempted'.format(season)] > 0, cumulative_stats['{0}_exp_attempted'.format(season)], .0000001)
+    fg_att_safe_from_divide_by_0 = np.where(cumulative_stats['{0}_fg_attempted'.format(season)] > 0, cumulative_stats['{0}_fg_attempted'.format(season)], .0000001)
+    cumulative_stats['{0}_exp_%'.format(season)]=cumulative_stats['{0}_exp_made'.format(season)]/exp_att_safe_from_divide_by_0
+    cumulative_stats['{0}_fg_%'.format(season)]=cumulative_stats['{0}_fg_made'.format(season)]/fg_att_safe_from_divide_by_0
+    cumulative_stats['{0}_exp_pts_above_expectation_per_att'.format(season)]=cumulative_stats['{0}_exp_pts_above_expectation'.format(season)]/exp_att_safe_from_divide_by_0
+    cumulative_stats['{0}_fg_pts_above_expectation_per_att'.format(season)]=cumulative_stats['{0}_fg_pts_above_expectation'.format(season)]/fg_att_safe_from_divide_by_0
+    cumulative_stats['{0}_total_pts_above_expectation'.format(season)]=cumulative_stats['{0}_fg_pts_above_expectation'.format(season)]+cumulative_stats['{0}_exp_pts_above_expectation'.format(season)]
+    
+# Drops NaN row from data set
+cumulative_stats = cumulative_stats[~cumulative_stats.Team.isnull()]
+
+# Create subset of data set for kickers who kicked in 2015
+cumulative_stats_kicked_in_2015 = cumulative_stats[(cumulative_stats['2015_exp_attempted'] > 0) | (cumulative_stats['2015_fg_attempted'] > 0)]
+
+##### Plot fg and xp % #####
+
+# Creates list of values for stats being plotted
+fg_percentages = np.array([np.array(cumulative_stats_kicked_in_2015.ix[cumulative_stats_kicked_in_2015.Team == 'CLV','2015_fg_%'])[0],np.max(cumulative_stats_kicked_in_2015['2015_fg_%']),np.median(cumulative_stats_kicked_in_2015['2015_fg_%']),np.min(cumulative_stats_kicked_in_2015['2015_fg_%'])])*100
+exp_percentages = np.array([np.array(cumulative_stats_kicked_in_2015.ix[cumulative_stats_kicked_in_2015.Team == 'CLV','2015_exp_%'])[0],np.max(cumulative_stats_kicked_in_2015['2015_exp_%']),np.median(cumulative_stats_kicked_in_2015['2015_exp_%']),np.min(cumulative_stats_kicked_in_2015['2015_exp_%'])])*100
+fg_percentages
+# the x locations for the groups
+ind = np.array(range(4))
+# the width of the bars
+width = 0.3       
+fig, ax = plt.subplots()
+rects1 = ax.bar(ind, fg_percentages, width, color='b')
+rects2 = ax.bar(ind + width, exp_percentages, width, color='r')
+# Label for y-axis
+ax.set_ylabel('% of kicks made')
+# Creates title
+ax.set_title('2015 Field Goal and Extra Point %')
+# Sets ticks on x-axis
+ax.set_xticks(ind + width)
+# Sets labels for ticks
+ax.set_xticklabels(('Cleveland','Max','Median', 'Min'))
+# Creates legend
+ax.legend((rects1[0], rects2[0]), ('FG%', 'XP%'),bbox_to_anchor=(.8415, 1), loc=3, borderaxespad=0. ,prop={'size':9})
+plt.show()
+
+##### Plot pts above expectation #####
+
+# Creates list of values for stats being plotted
+fg_pts_above_exp = [np.array(cumulative_stats_kicked_in_2015.ix[cumulative_stats_kicked_in_2015.Team == 'CLV','2015_fg_pts_above_expectation'])[0],np.max(cumulative_stats_kicked_in_2015['2015_fg_pts_above_expectation']),np.median(cumulative_stats_kicked_in_2015['2015_fg_pts_above_expectation']),np.min(cumulative_stats_kicked_in_2015['2015_fg_pts_above_expectation'])]
+xp_pts_above_exp = [np.array(cumulative_stats_kicked_in_2015.ix[cumulative_stats_kicked_in_2015.Team == 'CLV','2015_exp_pts_above_expectation'])[0],np.max(cumulative_stats_kicked_in_2015['2015_exp_pts_above_expectation']),np.median(cumulative_stats_kicked_in_2015['2015_exp_pts_above_expectation']),np.min(cumulative_stats_kicked_in_2015['2015_exp_pts_above_expectation'])]
+total_pts_above_exp = [np.array(cumulative_stats_kicked_in_2015.ix[cumulative_stats_kicked_in_2015.Team == 'CLV','2015_total_pts_above_expectation'])[0],np.max(cumulative_stats_kicked_in_2015['2015_total_pts_above_expectation']),np.median(cumulative_stats_kicked_in_2015['2015_total_pts_above_expectation']),np.min(cumulative_stats_kicked_in_2015['2015_total_pts_above_expectation'])]
+
+# the x locations for the groups
+ind = np.array(range(4))  
+
+# the width of the bars
+width = 0.25    
+fig, ax = plt.subplots()
+rects1 = ax.bar(ind, fg_pts_above_exp, width, color='b')
+rects2 = ax.bar(ind + width, xp_pts_above_exp, width, color='r')
+rects3 = ax.bar(ind + width + width, total_pts_above_exp, width, color='g')
+# Label for y-axis
+ax.set_ylabel('Points Scored Above Expectation')
+ax.set_title('2015 Kicking Points Above Expectation')
+ax.set_xticks(ind + width*1.55)
+ax.set_xticklabels(('Cleveland','Max','Median', 'Min'))
+ax.legend((rects1[0], rects2[0],rects3[0]), ('FG', 'XP','Total'))
+plt.show()
+
+#####################################################################################
+
+### Aggregating fg/xp stats for each kicker for each season ###
+
+# Creating column names for new dataframe
+seasons = list(range(2006,2016))
+stats = ['xp_attempted','xp_made','xp_%','xp_pts_above_expectation','fg_attempted','fg_made','fg_%','fg_pts_above_expectation','Age_Nov_1_Year_N']
+col_names = ["{0}_{1}".format(season,stat) for season in seasons for stat in stats]
+col_names.append('Name')
+
+# Creates new dataframe
+individual_stats = pd.DataFrame(columns=col_names, index=range(len(fg_and_exp.kickername.unique())))
+
+# Creates 'Name' column
+individual_stats.Name = fg_and_exp.kickername.unique()
+
+for kicker in individual_stats.Name.unique():
+    # Mask out rows associated with a specific kicker
+    one_kicker = fg_and_exp[fg_and_exp.kickername==kicker]
+    for season in seasons:
+        # Mask out rows associated with exp then fg
+        one_season_one_kicker_xp_data = one_kicker[(one_kicker.gameseason==season) & (one_kicker.specialteamstype == 'EXTRA POINT')]
+        one_season_one_kicker_fg_data = one_kicker[(one_kicker.gameseason==season) & (one_kicker.specialteamstype == 'FIELD GOAL')]
+        # Calculate number of exp and fg attempted in given season by given kicker
+        individual_stats.ix[individual_stats.Name == kicker, '{0}_xp_attempted'.format(season)]=len(one_season_one_kicker_xp_data)
+        individual_stats.ix[individual_stats.Name == kicker, '{0}_fg_attempted'.format(season)]=len(one_season_one_kicker_fg_data)
+        # Calculate number of exp and fg made in given season by given kicker
+        individual_stats.ix[individual_stats.Name == kicker, '{0}_xp_made'.format(season)]=np.sum(one_season_one_kicker_xp_data.kickresult.str.contains('MADE'))
+        individual_stats.ix[individual_stats.Name == kicker, '{0}_fg_made'.format(season)]=np.sum(one_season_one_kicker_fg_data.kickresult.str.contains('MADE'))
+        # Calculate pts above expectation scored in given season by given kicker
+        individual_stats.ix[individual_stats.Name == kicker, '{0}_xp_pts_above_expectation'.format(season)]=np.sum(one_season_one_kicker_xp_data.pts_above_expectation)
+        individual_stats.ix[individual_stats.Name == kicker, '{0}_fg_pts_above_expectation'.format(season)]=np.sum(one_season_one_kicker_fg_data.pts_above_expectation)
+        # Calculates age in given season for given kicker
+        individual_stats.ix[individual_stats.Name == kicker, '{0}_Age_Nov_1_Year_N'.format(season)]=np.median(one_kicker.ix[(one_kicker.gameseason==season),'Age_Nov_1_Year_N'])
+
+# Calculate exp_% and fg_% in given season by given kicker
+for season in seasons:
+    xp_att_safe_from_divide_by_0 = np.where(individual_stats['{0}_xp_attempted'.format(season)] > 0, individual_stats['{0}_xp_attempted'.format(season)], .0000001)
+    fg_att_safe_from_divide_by_0 = np.where(individual_stats['{0}_fg_attempted'.format(season)] > 0, individual_stats['{0}_fg_attempted'.format(season)], .0000001)
+    individual_stats['{0}_xp_%'.format(season)]=individual_stats['{0}_xp_made'.format(season)]/xp_att_safe_from_divide_by_0
+    individual_stats['{0}_fg_%'.format(season)]=individual_stats['{0}_fg_made'.format(season)]/fg_att_safe_from_divide_by_0
+    individual_stats['{0}_xp_pts_above_expectation_per_att'.format(season)]=individual_stats['{0}_xp_pts_above_expectation'.format(season)]/xp_att_safe_from_divide_by_0
+    individual_stats['{0}_fg_pts_above_expectation_per_att'.format(season)]=individual_stats['{0}_fg_pts_above_expectation'.format(season)]/fg_att_safe_from_divide_by_0
+    individual_stats['{0}_total_pts_above_expectation'.format(season)]=individual_stats['{0}_fg_pts_above_expectation'.format(season)]+individual_stats['{0}_xp_pts_above_expectation'.format(season)]
+    individual_stats['{0}_total_pts_above_expectation_per_att'.format(season)]=individual_stats['{0}_total_pts_above_expectation'.format(season)]/(xp_att_safe_from_divide_by_0 + fg_att_safe_from_divide_by_0)
+ 
+# Drops NaN row from data set
+individual_stats = individual_stats[~individual_stats.Name.isnull()]
+
+##############################################
+
+# Creating new dataframe to be used for modeling Travis Coons' projected fg/xp production in 2016
+
+season_names = ['first_season','second_season','third_season']
+stats = ['xp_attempted','xp_made','xp_%','xp_pts_above_expectation','xp_pts_above_expectation_per_att','fg_attempted','fg_made','fg_%','fg_pts_above_expectation','fg_pts_above_expectation_per_att','total_pts_above_expectation','total_pts_above_expectation_per_att','Age_Nov_1_Year_N']
+col_names = ["{0}_{1}".format(season_name,stat) for season_name in season_names for stat in stats]
+col_names.append('Name')
+
+# Initialize empty dataframe
+kickers_who_kicked_in_consecutive_seasons = pd.DataFrame(columns=col_names, index=[])
+
+seasons = list(range(2006,2015))
+df_dict = {}
+for season in seasons:
+    # Creates list of column names corresponding to stats associated with 'this' season (2006-2015) 
+    this_season_stats = list(individual_stats.columns[individual_stats.columns.str.contains(str(season))])
+    next_season_stats = list(individual_stats.columns[individual_stats.columns.str.contains(str(season+1))]) # Columns associated with the next season
+    next_next_season_stats = list(individual_stats.columns[individual_stats.columns.str.contains(str(season+2))]) # Columns associated with the next season
+    # Creating list of column names for this season, next season and the season after to use for prediction
+    three_seasons_stats = list(individual_stats.columns[individual_stats.columns.str.contains(str(season))] | individual_stats.columns[individual_stats.columns.str.contains(str(season+1))] | individual_stats.columns[individual_stats.columns.str.contains(str(season+2))])
+    three_seasons_stats.append('Name')
+    # Creates new dataframe by retaining only players who played in season and next_season, only retains their stats from those respective seasons
+    df_dict['played_{0}_and_{1}'.format(season,season+1)] = individual_stats.ix[(np.sum(individual_stats[this_season_stats]>0,axis=1)> 0) & (np.sum(individual_stats[next_season_stats]>0,axis=1)>0),three_seasons_stats]
+    # Creates list of new column names with corresponding prefixes based on season 
+    first_season_cols = [(column,"first_season_" + column[5:]) for column in df_dict['played_{0}_and_{1}'.format(season,season+1)].ix[:, this_season_stats].columns.values]
+    second_season_cols = [(column,"second_season_" + column[5:]) for column in df_dict['played_{0}_and_{1}'.format(season,season+1)].ix[:, next_season_stats].columns.values]
+    third_season_cols = [(column,"third_season_" + column[5:]) for column in df_dict['played_{0}_and_{1}'.format(season,season+1)].ix[:, next_next_season_stats].columns.values]
+    # Combines lists together
+    second_season_cols.extend(third_season_cols)
+    first_season_cols.extend(second_season_cols)
+    # Renames columns
+    df_dict['played_{0}_and_{1}'.format(season,season+1)].rename(columns =  dict(first_season_cols), inplace = True)
+
+# Append each 3 year subset dataframe into one dataframe
+for key in df_dict.keys():
+    if key != 'played_2014_and_2015':
+        kickers_who_kicked_in_consecutive_seasons = kickers_who_kicked_in_consecutive_seasons.append(df_dict[key])
+    else:
+        # Only keeping Travis Coons from dataframe that contains player who played in 2014-2015 (don't have 2016 data so can't be used for training model)
+        kickers_who_kicked_in_consecutive_seasons = kickers_who_kicked_in_consecutive_seasons.append(df_dict[key].ix[df_dict[key].Name=='Coons, Travis'])
+ 
+################################################################################################ 
+  
+###### Predicting production in 3rd season on fg/xp after playing in 2 consecutive seasons #####
+
+season_names = ['first_season','second_season']
+stats = ['xp_attempted','xp_made','xp_%','xp_pts_above_expectation','xp_pts_above_expectation_per_att','fg_attempted','fg_made','fg_%','fg_pts_above_expectation','fg_pts_above_expectation_per_att','total_pts_above_expectation','total_pts_above_expectation_per_att','Age_Nov_1_Year_N']
+predictor_columns = ["{0}_{1}".format(season_name,stat) for season_name in season_names for stat in stats]
+
+# Remove kickers who didn't kick in their 3rd season
+kickers_played_third_season = kickers_who_kicked_in_consecutive_seasons[(kickers_who_kicked_in_consecutive_seasons['third_season_fg_attempted'] > 0) | (kickers_who_kicked_in_consecutive_seasons['third_season_xp_attempted'] > 0)]
+kickers_played_third_season.reset_index(inplace=True)
+kickers_played_third_season.drop('index',axis=1,inplace=True)
+
+# Isolate Travis Coons' data
+coons_row = kickers_who_kicked_in_consecutive_seasons[(kickers_who_kicked_in_consecutive_seasons.Name == 'Coons, Travis')]
+
+# Append Travis Coons' data to end of data set
+kickers_played_third_season_and_coons = kickers_played_third_season.append(coons_row)
+kickers_played_third_season_and_coons.reset_index(inplace=True)
+kickers_played_third_season_and_coons.drop('index',axis=1,inplace=True)
+
+coons_row_index = np.argmax(kickers_played_third_season_and_coons.Name == 'Coons, Travis')
+
+# Scales and centers the features associated with field goal/extra point attempts
+features = np.array(kickers_played_third_season_and_coons.ix[:,predictor_columns])
+
+# Scales and centers the features
+features_std = preprocessing.scale(features)
+
+##### PCA #####
+number_of_components = features_std.shape[1]
+pca = decomposition.PCA(n_components=number_of_components)
+pca.fit(features_std)
+var= pca.explained_variance_ratio_ #The amount of variance that each PC explains
+var1=np.cumsum(np.round(pca.explained_variance_ratio_, decimals=4)*100) # Cumulative Variance explained by number of components
+
+# Chose 12 components based on results from var1 and empirical testing
+pca = decomposition.PCA(n_components=12)
+    
+# Finds principal components
+pca.fit(features_std)
+
+# Creates new array containing principal components
+features_std_pca = np.array(pca.fit_transform(features_std))
+
+# Save for prediction later
+coons_features_std_pca = features_std_pca[coons_row_index,:]
+
+# Drop Coons' data from feature matrix prior to model fitting
+features_std_pca = features_std_pca[:coons_row_index,:]
+
+# Creates target vectors (not including Coons)
+target_fg_percentage = np.array(kickers_played_third_season_and_coons.ix[:coons_row_index-1,'third_season_fg_%'])
+target_pts_per_att = np.array(kickers_played_third_season_and_coons.ix[:coons_row_index-1,'third_season_fg_pts_above_expectation_per_att'])
+
+### Making 2016 Predictions for Coons ###
+
+## Optimal values for hyperparameters were learned using GridSearchCV ##
+
+# FG %
+
+xgb_fg_percentage = xgb.XGBRegressor(min_child_weight = 13, learning_rate = 0.04, colsample_bytree = 0.75, subsample = 0.3, reg_lambda = 4, max_depth = 2)
+
+xgb_fg_percentage.fit(features_std_pca,target_fg_percentage)
+
+coons_pred_fg_percentage = xgb_fg_percentage.predict(coons_features_std_pca.reshape(1,-1))
+
+# FG pts per att
+
+xgb_fg_pts_per_att = xgb.XGBRegressor(min_child_weight = 1, learning_rate = 0.045, colsample_bytree = 0.15, subsample = 0.9, reg_lambda = 12, max_depth = 1)
+
+xgb_fg_pts_per_att.fit(features_std_pca,target_pts_per_att)
+
+coons_pred_fg_pts_per_att = xgb_fg_pts_per_att.predict(coons_features_std_pca.reshape(1,-1))
+
+###################################################################################
+###################################################################################
+
+##### Kickoff Analysis ######
+
+# Create dataset containing only observations which were fg or extra points
+kickoffs = kick_data[kick_data.specialteamstype == 'KICKOFF']
+
+# Creates team column
+kickoffs['team'] , x = kickoffs['kicker'].str.split(' ', 1).str
+
+# Changes values for 2015 season with team name == 'SL' to 'LA'
+kickoffs.ix[(kickoffs.team=='SL') & (kickoffs.gameseason == 2015),'team'] = 'LA'
+
+# Drop kickoffs w/ n/a hangtime/kickdepth --> doing this because only taking avg/median of hangtime, not total --> also drop most of onside kicks and all quick kicks
+# kickoffs = kickoffs[(~kickoffs.hangtime.isnull()) & (~kickoffs.kickdepth.isnull())]
+
+# Fixing incorrect data (kickdepth has a value of 750, should be 75)
+kickoffs.ix[kickoffs.kickdepth==750,'kickdepth'] = 75
+
+# Drops kick with 103 as kickyards, returnyards and gainloss
+kickoffs = kickoffs[kickoffs.kickyards != 103]
+
+# Drops onside kicks, quick kicks and kicks with n/a hangtime
+## Dropped n/a hangtime kicks b/c will be using median hangtime to evaluate, so removing them shouldn't bias the results
+kickoffs_no_onside = kickoffs[(kickoffs.kickresult != 'ONSIDE') & (kickoffs.kickresult != 'RECOVERED BY KICKING TEAM') & (kickoffs.kicktype != 'Q') & (~kickoffs.hangtime.isnull())]
+
+# Creates kick_length column with correction for negative values
+kickoffs_no_onside['kick_length'] = np.where(kickoffs_no_onside.kickyards < 0, kickoffs_no_onside.kickdepth, kickoffs_no_onside.kickyards)
+
+# Drop kick with negative kickyards and no kickdepth
+kickoffs_no_onside = kickoffs_no_onside[~np.isnan(kickoffs_no_onside.kick_length)]
+kickoffs_no_onside.reset_index(inplace=True)
+
+#########################################################################
+
+### Plotting hangtime, kick length and kick width vs. field position ###
+
+# Creates kickyards array 
+kick_yards = kickoffs_no_onside['kick_length']
+
+# Create array of field_position resulting from kickoffs
+field_position = kickoffs_no_onside.playendfieldposition 
+
+# Convert negative field_position values to positive values
+field_position = np.where(field_position < 0, 100+field_position, field_position)
+
+# Calculate line of best fit
+m, b = np.polyfit(kick_yards, field_position, 1)
+
+plt.title('Kickoff Length vs. Field Position, 2006-2015')
+plt.ylabel('Return Team Field Position (0 = Own Goal Line)')
+plt.xlabel('Kickoff Length (Yards)')
+plt.plot(kick_yards, field_position, '.')
+plt.plot(kick_yards, m*kick_yards + b, '-')
+
+### Hangtime ###
+
+# Dropping kicks with hangtime = 0 --> kicks with hangtime = 0 don't indicate kickers ability to generate hangtime when desired
+kickoffs_hangtime_greater_than_zero = kickoffs_no_onside[kickoffs_no_onside.hangtime > 0]
+
+hangtime = kickoffs_hangtime_greater_than_zero.hangtime
+
+# Create array of field_position resulting from kickoffs
+field_position = kickoffs_hangtime_greater_than_zero.playendfieldposition
+
+# Convert negative field_position values to positive values
+field_position = np.where(field_position < 0, 100+field_position, field_position)
+
+# fit with np.polyfit
+m, b = np.polyfit(hangtime, field_position, 1)
+
+plt.title('Hangtime vs. Field Position, 2006-2015')
+plt.ylabel('Return Team Field Position (0 = Own Goal Line)')
+plt.xlabel('Kickoff Hangtime (seconds)')
+plt.plot(hangtime, field_position, '.')
+plt.plot(hangtime, m*hangtime + b, '-')
+
+### Kick Width ###
+
+kickoffs_no_onside_present_kickwidth = kickoffs_no_onside[~kickoffs_no_onside.kickwidth.isnull()]
+
+# Creates kickyards array with correction for negative values
+kick_width = kickoffs_no_onside_present_kickwidth.kickwidth
+
+# Create array of field_position resulting from kickoffs
+field_position = kickoffs_no_onside_present_kickwidth.playendfieldposition
+
+# Convert negative field_position values to positive values
+field_position = np.where(field_position < 0, 100+field_position, field_position)
+
+# Calculate line of best fit
+m, b = np.polyfit(kick_width, field_position, 1)
+
+plt.title('Kickoff Width vs. Field Position, 2006-2015')
+plt.ylabel('Return Team Field Position (0 = Own Goal Line)')
+plt.xlabel('Kickoff Width (Yards)')
+plt.plot(kick_width, field_position, '.')
+plt.plot(kick_width, m*kick_width + b, '-')
+
+#####################################################################################
+
+##### Calculating kickoff stats for teams #####
+
+# Creating column names for new dataframe
+seasons = list(range(2006,2016))
+stats = ['avg_kickdepth','avg_hangtime','median_kicklength','median_hangtime']
+col_names = ["{0}_{1}".format(season,stat) for season in seasons for stat in stats]
+col_names.append('Team')
+
+# Creates new dataframe
+kickoff_stats = pd.DataFrame(columns=col_names, index=range(len(kickoffs.team.unique())))
+
+# Creates 'Name' column
+kickoff_stats.Team = kickoffs.team.unique()
+
+for team in kickoff_stats.Team.unique():
+    # Mask out rows associated with a specific kicker
+    # one_team = kickoffs[kickoffs.team == team]
+    one_team = kickoffs_no_onside[kickoffs_no_onside.team == team]
+    for season in seasons:
+        # Mask out rows associated with given season
+        one_season_one_team = one_team[(one_team.gameseason==season)]
+        # Calculate median hangtime
+        kickoff_stats.ix[kickoff_stats.Team == team, '{0}_median_hangtime'.format(season)]=np.median(one_season_one_team.ix[one_season_one_team.team==team,'hangtime'])
+        # Calculate median kick_length
+        kickoff_stats.ix[kickoff_stats.Team == team, '{0}_median_kicklength'.format(season)]=np.median(one_season_one_team.ix[one_season_one_team.team==team,'kick_length'])
+
+# Drops NaN row from data set
+kickoff_stats = kickoff_stats[~kickoff_stats.Team.isnull()]
+
+# Create subset of data set for teams who played in 2015
+kickoff_stats_kicked_in_2015 = kickoff_stats[(kickoff_stats['2015_median_hangtime'] > 0)]
+
+##### Plot hangtime #####
+
+median_hangtimes = [np.array(kickoff_stats_kicked_in_2015.ix[kickoff_stats_kicked_in_2015.Team == 'CLV','2015_median_hangtime'])[0],np.max(kickoff_stats_kicked_in_2015['2015_median_hangtime']),np.median(kickoff_stats_kicked_in_2015['2015_median_hangtime']),np.min(kickoff_stats_kicked_in_2015['2015_median_hangtime'])]
+
+# the x locations for the groups
+ind = np.array(range(4))
+# the width of the bars
+width = 0.4 
+fig, ax = plt.subplots()
+# Sets colors for bars
+colors = ['orange', 'blue', 'red', 'green']
+ax.bar(ind, median_hangtimes, color=colors)
+# Label for y-axis
+ax.set_ylabel('Median Hangtime (seconds)')
+# Sets title
+ax.set_title('2015 Median Kickoff Hangtime by Team')
+# Sets ticks on x-axis
+ax.set_xticks(ind+width)
+# Labels for bars
+ax.set_xticklabels(('Cleveland','Max','Median', 'Min'))
+# Minimum value on y-axis
+ax.set_ylim(ymin=2.5)
+plt.show()
+
+##### Plot kickdepth #####
+
+median_kicklengths = [np.array(kickoff_stats_kicked_in_2015.ix[kickoff_stats_kicked_in_2015.Team == 'CLV','2015_median_kicklength'])[0],np.max(kickoff_stats_kicked_in_2015['2015_median_kicklength']),np.median(kickoff_stats_kicked_in_2015['2015_median_kicklength']),np.min(kickoff_stats_kicked_in_2015['2015_median_kicklength'])]
+
+# the x locations for the groups
+ind = np.array(range(4))
+# the width of the bars
+width = 0.4
+fig, ax = plt.subplots()
+colors = ['orange', 'blue', 'red', 'green']
+ax.bar(ind, median_kicklengths, color=colors)
+ax.set_ylabel('Median Kickoff Length (yards)')
+ax.set_title('2015 Median Kickoff Length by Team')
+ax.set_xticks(ind+width)
+ax.set_xticklabels(('Cleveland','Max','Median', 'Min'))
+ax.set_ylim(ymin=40)
+plt.show()
+
+#####################################################################################
+#####################################################################################
+
+##### Calculates kickoff stats for individuals #####
+
+# Creating column names for new dataframe
+seasons = list(range(2006,2016))
+stats = ['median_kicklength','median_hangtime','number_of_kickoffs','Age_Nov_1_Year_N']
+col_names = ["{0}_{1}".format(season,stat) for season in seasons for stat in stats]
+col_names.append('Name')
+
+# Creates new dataframe
+individual_kickoff_stats = pd.DataFrame(columns=col_names, index=range(len(kickoffs_no_onside.kickername.unique())))
+
+# Creates 'Name' column
+individual_kickoff_stats.Name = kickoffs_no_onside.kickername.unique()
+
+for kicker in individual_kickoff_stats.Name.unique():
+    # Mask out rows associated with a specific kicker
+    one_kicker = kickoffs_no_onside[kickoffs_no_onside.kickername == kicker]
+    for season in seasons:
+        # Mask out rows associated with given season
+        one_season_one_kicker = one_kicker[(one_kicker.gameseason==season)]
+        # Calculate median hangtime
+        individual_kickoff_stats.ix[individual_kickoff_stats.Name == kicker, '{0}_median_hangtime'.format(season)]=np.median(one_season_one_kicker.ix[one_season_one_kicker.kickername==kicker,'hangtime'])
+        # Calculate median kickdistance
+        individual_kickoff_stats.ix[individual_kickoff_stats.Name == kicker, '{0}_median_kicklength'.format(season)]=np.median(one_season_one_kicker.ix[one_season_one_kicker.kickername==kicker,'kick_length'])
+        # Calculate number of kickoffs in given season by given kicker
+        individual_kickoff_stats.ix[individual_kickoff_stats.Name == kicker, '{0}_number_of_kickoffs'.format(season)]=len(one_season_one_kicker)
+        # Calculate number of kickoffs in given season by given kicker
+        individual_kickoff_stats.ix[individual_kickoff_stats.Name == kicker, '{0}_Age_Nov_1_Year_N'.format(season)]=np.median(one_season_one_kicker.Age_Nov_1_Year_N)
+
+# Drops NaN row from data set
+individual_kickoff_stats = individual_kickoff_stats[~individual_kickoff_stats.Name.isnull()]
+
+##### Creating new dataframe to be used for modeling Travis Coons' projected kickoff production in 2016 #####
+
+season_names = ['first_season','second_season','third_season']
+stats = ['median_hangtime','median_kicklength','number_of_kickoffs','Age_Nov_1_Year_N']
+col_names = ["{0}_{1}".format(season_name,stat) for season_name in season_names for stat in stats]
+col_names.append('Name')
+
+# Initialize empty dataframe
+kickers_who_kicked_in_consecutive_seasons_kickoffs = pd.DataFrame(columns=col_names, index=[])
+
+seasons = list(range(2006,2015))
+df_dict = {}
+for season in seasons:
+    # Creates list of column names corresponding to stats associated with 'this' season (2006-2015) 
+    this_season_stats = list(individual_kickoff_stats.columns[individual_kickoff_stats.columns.str.contains(str(season))])
+    next_season_stats = list(individual_kickoff_stats.columns[individual_kickoff_stats.columns.str.contains(str(season+1))]) # Columns associated with the next season
+    next_next_season_stats = list(individual_kickoff_stats.columns[individual_kickoff_stats.columns.str.contains(str(season+2))]) # Columns associated with the next season
+    # Creating list of column names for this season, next season and the season after to use for prediction
+    three_seasons_stats = list(individual_kickoff_stats.columns[individual_kickoff_stats.columns.str.contains(str(season))] | individual_kickoff_stats.columns[individual_kickoff_stats.columns.str.contains(str(season+1))] | individual_kickoff_stats.columns[individual_kickoff_stats.columns.str.contains(str(season+2))])
+    three_seasons_stats.append('Name')
+    # Creates new dataframe by retaining only players who played in season and next_season, only retains their stats from those respective seasons
+    df_dict['played_{0}_and_{1}'.format(season,season+1)] = individual_kickoff_stats.ix[(np.sum(individual_kickoff_stats[this_season_stats]>0,axis=1)> 0) & (np.sum(individual_kickoff_stats[next_season_stats]>0,axis=1)>0),three_seasons_stats]
+    # Creates list of new column names with corresponding prefixes based on season 
+    first_season_cols = [(column,"first_season_" + column[5:]) for column in df_dict['played_{0}_and_{1}'.format(season,season+1)].ix[:, this_season_stats].columns.values]
+    second_season_cols = [(column,"second_season_" + column[5:]) for column in df_dict['played_{0}_and_{1}'.format(season,season+1)].ix[:, next_season_stats].columns.values]
+    third_season_cols = [(column,"third_season_" + column[5:]) for column in df_dict['played_{0}_and_{1}'.format(season,season+1)].ix[:, next_next_season_stats].columns.values]
+    # Combines lists together
+    second_season_cols.extend(third_season_cols)
+    first_season_cols.extend(second_season_cols)
+    # Renames columns
+    df_dict['played_{0}_and_{1}'.format(season,season+1)].rename(columns =  dict(first_season_cols), inplace = True)
+
+# Append each 3 year subset dataframe into one dataframe
+for key in df_dict.keys():
+    if key != 'played_2014_and_2015':
+        kickers_who_kicked_in_consecutive_seasons_kickoffs = kickers_who_kicked_in_consecutive_seasons_kickoffs.append(df_dict[key])
+    else:
+        # Only keeping Travis Coons from dataframe that contains player who played in 2014-2015 (don't have 2016 data so can't be used for training model)
+        kickers_who_kicked_in_consecutive_seasons_kickoffs = kickers_who_kicked_in_consecutive_seasons_kickoffs.append(df_dict[key].ix[df_dict[key].Name=='Coons, Travis'])
+
+###### Predicting production in 3rd season on kickoffs after playing in 2 consecutive seasons #####
+
+season_names = ['first_season','second_season']
+stats = ['median_hangtime','median_kicklength','number_of_kickoffs','Age_Nov_1_Year_N']
+predictor_columns = ["{0}_{1}".format(season_name,stat) for season_name in season_names for stat in stats]
+
+# Remove kickers who didn't kick in their 3rd season
+kickers_played_third_season = kickers_who_kicked_in_consecutive_seasons_kickoffs[(kickers_who_kicked_in_consecutive_seasons_kickoffs['third_season_median_hangtime'] > 0) | (kickers_who_kicked_in_consecutive_seasons_kickoffs['third_season_median_kicklength'] > 0)]
+kickers_played_third_season.reset_index(inplace=True)
+kickers_played_third_season.drop('index',axis=1,inplace=True)
+
+# Isolate Travis Coons' data
+coons_row = kickers_who_kicked_in_consecutive_seasons_kickoffs[(kickers_who_kicked_in_consecutive_seasons_kickoffs.Name == 'Coons, Travis')]
+
+# Append Travis Coons' data to end of data set
+kickers_played_third_season_and_coons = kickers_played_third_season.append(coons_row)
+kickers_played_third_season_and_coons.reset_index(inplace=True)
+kickers_played_third_season_and_coons.drop('index',axis=1,inplace=True)
+
+coons_row_index = np.argmax(kickers_played_third_season_and_coons.Name == 'Coons, Travis')
+
+# Scales and centers the features associated with field goal/extra point attempts
+features = np.array(kickers_played_third_season_and_coons.ix[:,predictor_columns])
+
+# Scales and centers the features
+features_std = preprocessing.scale(features)
+
+##### PCA #####
+number_of_components = features_std.shape[1]
+pca = decomposition.PCA(n_components=number_of_components)
+pca.fit(features_std)
+var= pca.explained_variance_ratio_ #The amount of variance that each PC explains
+var1=np.cumsum(np.round(pca.explained_variance_ratio_, decimals=4)*100) # Cumulative Variance explained by number of components
+
+# Used 7 components after examining results from var1
+pca = decomposition.PCA(n_components=7)
+
+# Finds principal components
+pca.fit(features_std)
+
+# Creates new array containing principal components
+features_std_pca = np.array(pca.fit_transform(features_std))
+
+# Save for prediction later
+coons_features_std_pca = features_std_pca[coons_row_index,:]
+
+# Drop Coons' data from feature matrix prior to model fitting
+features_std_pca = features_std_pca[:coons_row_index,:]
+
+# Creates target vector without Coons' data --> coons_row_index-1 b/c .ix is inclusive
+target_hangtime = np.array(kickers_played_third_season_and_coons.ix[:coons_row_index-1,'third_season_median_hangtime'])
+target_kicklength = np.array(kickers_played_third_season_and_coons.ix[:coons_row_index-1,'third_season_median_kicklength'])
+
+##### Fitting model to predict hangtime and kick length #####
+
+### Optimal values for hyperparameters were learned using GridSearchCV (same structure as shown in GridSearch CV block above)
+
+# Hangtime
+
+xgb_hangtime = xgb.XGBRegressor(max_depth=1, learning_rate=0.06, min_child_weight=7, reg_lambda = 5, subsample = 1, colsample_bytree = 0.325)
+
+xgb_hangtime.fit(features_std_pca,target_hangtime)
+
+coons_pred_hangtime = xgb_hangtime.predict(coons_features_std_pca.reshape(1,-1))
+
+# Kicklength
+
+xgb_kicklength = xgb.XGBRegressor(max_depth=1, learning_rate=0.35, min_child_weight=3, reg_lambda = 1.75, subsample = 1, colsample_bytree = 0.75)
+
+xgb_kicklength.fit(features_std_pca,target_kicklength)
+
+coons_pred_kicklength = xgb_kicklength.predict(coons_features_std_pca.reshape(1,-1))
